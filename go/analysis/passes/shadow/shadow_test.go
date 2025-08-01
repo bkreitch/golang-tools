@@ -15,3 +15,13 @@ func Test(t *testing.T) {
 	testdata := analysistest.TestData()
 	analysistest.Run(t, testdata, shadow.Analyzer, "a")
 }
+
+func TestB(t *testing.T) {
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, shadow.Analyzer, "b")
+}
+
+func TestC(t *testing.T) {
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, shadow.Analyzer, "c")
+}

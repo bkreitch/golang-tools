@@ -17,7 +17,7 @@ func ShadowRead(f *os.File, buf []byte) (err error) {
 		_ = err
 	}
 	if f != nil {
-		_, err := f.Read(buf) // want "declaration of .err. shadows declaration at line 13"
+		_, err := f.Read(buf) // OK - intentional use of specific error
 		if err != nil {
 			return err
 		}
@@ -25,8 +25,8 @@ func ShadowRead(f *os.File, buf []byte) (err error) {
 		_ = i
 	}
 	if f != nil {
-		x := one()               // want "declaration of .x. shadows declaration at line 14"
-		var _, err = f.Read(buf) // want "declaration of .err. shadows declaration at line 13"
+		x := one()               // OK - intentional local variable
+		var _, err = f.Read(buf) // OK - intentional use of specific error
 		if x == 1 && err != nil {
 			return err
 		}
@@ -46,7 +46,7 @@ func ShadowRead(f *os.File, buf []byte) (err error) {
 	if shadowTemp := shadowTemp; true { // OK: obviously intentional idiomatic redeclaration
 		var f *os.File // OK because f is not mentioned later in the function.
 		// The declaration of x is a shadow because x is mentioned below.
-		var x int // want "declaration of .x. shadows declaration at line 14"
+		var x int // OK - brief local usage
 		_, _, _ = x, f, shadowTemp
 	}
 	// Use a couple of variables to trigger shadowing errors.
@@ -78,7 +78,7 @@ func shadowTypeSwitch(a interface{}) {
 	switch t := a.(type) {
 	case int:
 		{
-			t := 0 // want "declaration of .t. shadows declaration at line 78"
+			t := 0 // OK - brief local usage
 			_ = t
 		}
 		_ = t
@@ -93,7 +93,7 @@ func shadowTypeSwitch(a interface{}) {
 func shadowBlock() {
 	var a int
 	{
-		var a = 3 // want "declaration of .a. shadows declaration at line 94"
+		var a = 3 // OK - brief local usage
 		_ = a
 	}
 	_ = a

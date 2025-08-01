@@ -6,9 +6,11 @@ package shadow
 
 import (
 	_ "embed"
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
+	"path/filepath"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
@@ -39,111 +41,108 @@ func init() {
 func run(pass *analysis.Pass) (any, error) {
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
-	spans := make(map[types.Object]span)
-	for id, obj := range pass.TypesInfo.Defs {
-		// Ignore identifiers that don't denote objects
-		// (package names, symbolic variables such as t
-		// in t := x.(type) of type switch headers).
+	analyzer := &shadowAnalyzer{
+		pass:           pass,
+		inspect:        inspect,
+		usagesByObject: make(map[types.Object][]*ast.Ident),
+		assignStmts:    make([]*ast.AssignStmt, 0),
+		incDecStmts:    make([]*ast.IncDecStmt, 0),
+	}
+
+	for ident, obj := range pass.TypesInfo.Uses {
 		if obj != nil {
-			growSpan(spans, obj, id.Pos(), id.End())
-		}
-	}
-	for id, obj := range pass.TypesInfo.Uses {
-		growSpan(spans, obj, id.Pos(), id.End())
-	}
-	for node, obj := range pass.TypesInfo.Implicits {
-		// A type switch with a short variable declaration
-		// such as t := x.(type) doesn't declare the symbolic
-		// variable (t in the example) at the switch header;
-		// instead a new variable t (with specific type) is
-		// declared implicitly for each case. Such variables
-		// are found in the types.Info.Implicits (not Defs)
-		// map. Add them here, assuming they are declared at
-		// the type cases' colon ":".
-		if cc, ok := node.(*ast.CaseClause); ok {
-			growSpan(spans, obj, cc.Colon, cc.Colon)
+			analyzer.usagesByObject[obj] = append(analyzer.usagesByObject[obj], ident)
 		}
 	}
 
 	nodeFilter := []ast.Node{
 		(*ast.AssignStmt)(nil),
-		(*ast.GenDecl)(nil),
+		(*ast.IncDecStmt)(nil),
 	}
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
 		switch n := n.(type) {
 		case *ast.AssignStmt:
-			checkShadowAssignment(pass, spans, n)
+			analyzer.assignStmts = append(analyzer.assignStmts, n)
+		case *ast.IncDecStmt:
+			analyzer.incDecStmts = append(analyzer.incDecStmts, n)
+		}
+	})
+
+	declFilter := []ast.Node{
+		(*ast.AssignStmt)(nil),
+		(*ast.GenDecl)(nil),
+	}
+	inspect.Preorder(declFilter, func(n ast.Node) {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			analyzer.checkShadowAssignment(n)
 		case *ast.GenDecl:
-			checkShadowDecl(pass, spans, n)
+			analyzer.checkShadowDecl(n)
 		}
 	})
 	return nil, nil
 }
 
-// A span stores the minimum range of byte positions in the file in which a
-// given variable (types.Object) is mentioned. It is lexically defined: it spans
-// from the beginning of its first mention to the end of its last mention.
-// A variable is considered shadowed (if strict is off) only if the
-// shadowing variable is declared within the span of the shadowed variable.
-// In other words, if a variable is shadowed but not used after the shadowed
-// variable is declared, it is inconsequential and not worth complaining about.
-// This simple check dramatically reduces the nuisance rate for the shadowing
-// check, at least until something cleverer comes along.
-//
-// One wrinkle: A "naked return" is a silent use of a variable that the Span
-// will not capture, but the compilers catch naked returns of shadowed
-// variables so we don't need to.
-//
-// Cases this gets wrong (TODO):
-// - If a for loop's continuation statement mentions a variable redeclared in
-// the block, we should complain about it but don't.
-// - A variable declared inside a function literal can falsely be identified
-// as shadowing a variable in the outer function.
-type span struct {
-	min token.Pos
-	max token.Pos
-}
-
-// contains reports whether the position is inside the span.
-func (s span) contains(pos token.Pos) bool {
-	return s.min <= pos && pos < s.max
-}
-
-// growSpan expands the span for the object to contain the source range [pos, end).
-func growSpan(spans map[types.Object]span, obj types.Object, pos, end token.Pos) {
-	if strict {
-		return // No need
-	}
-	s, ok := spans[obj]
-	if ok {
-		if s.min > pos {
-			s.min = pos
-		}
-		if s.max < end {
-			s.max = end
-		}
-	} else {
-		s = span{pos, end}
-	}
-	spans[obj] = s
+type shadowAnalyzer struct {
+	pass           *analysis.Pass
+	inspect        *inspector.Inspector
+	usagesByObject map[types.Object][]*ast.Ident
+	assignStmts    []*ast.AssignStmt
+	incDecStmts    []*ast.IncDecStmt
 }
 
 // checkShadowAssignment checks for shadowing in a short variable declaration.
-func checkShadowAssignment(pass *analysis.Pass, spans map[types.Object]span, a *ast.AssignStmt) {
+func (sa *shadowAnalyzer) checkShadowAssignment(a *ast.AssignStmt) {
 	if a.Tok != token.DEFINE {
 		return
 	}
-	if idiomaticShortRedecl(pass, a) {
+	if idiomaticShortRedecl(sa.pass, a) || loopVariableDecl(sa.pass, a) {
 		return
 	}
 	for _, expr := range a.Lhs {
 		ident, ok := expr.(*ast.Ident)
 		if !ok {
-			pass.ReportRangef(expr, "invalid AST: short variable declaration of non-identifier")
+			sa.pass.ReportRangef(expr, "invalid AST: short variable declaration of non-identifier")
 			return
 		}
-		checkShadowing(pass, spans, ident)
+		sa.checkShadowing(ident)
 	}
+}
+
+// loopVariableDecl checks if this assignment statement is a loop variable declaration.
+func loopVariableDecl(pass *analysis.Pass, a *ast.AssignStmt) bool {
+	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	var isLoop bool
+	inspect.Preorder([]ast.Node{(*ast.ForStmt)(nil), (*ast.RangeStmt)(nil)}, func(n ast.Node) {
+		if isLoop {
+			return
+		}
+		switch stmt := n.(type) {
+		case *ast.ForStmt:
+			isLoop = (stmt.Init == a)
+		case *ast.RangeStmt:
+			isLoop = stmt.Tok == token.DEFINE && isRangeVariableMatch(a, stmt)
+		}
+	})
+	return isLoop
+}
+
+func isRangeVariableMatch(a *ast.AssignStmt, stmt *ast.RangeStmt) bool {
+	for _, lhs := range a.Lhs {
+		ident, ok := lhs.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		for _, rangeVar := range []ast.Expr{stmt.Key, stmt.Value} {
+			if rangeVar == nil {
+				continue
+			}
+			if rangeIdent, ok := rangeVar.(*ast.Ident); ok && rangeIdent.Pos() == ident.Pos() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // idiomaticShortRedecl reports whether this short declaration can be ignored for
@@ -202,14 +201,14 @@ func idiomaticRedecl(d *ast.ValueSpec) bool {
 }
 
 // checkShadowDecl checks for shadowing in a general variable declaration.
-func checkShadowDecl(pass *analysis.Pass, spans map[types.Object]span, d *ast.GenDecl) {
+func (sa *shadowAnalyzer) checkShadowDecl(d *ast.GenDecl) {
 	if d.Tok != token.VAR {
 		return
 	}
 	for _, spec := range d.Specs {
 		valueSpec, ok := spec.(*ast.ValueSpec)
 		if !ok {
-			pass.ReportRangef(spec, "invalid AST: var GenDecl not ValueSpec")
+			sa.pass.ReportRangef(spec, "invalid AST: var GenDecl not ValueSpec")
 			return
 		}
 		// Don't complain about deliberate redeclarations of the form
@@ -218,18 +217,18 @@ func checkShadowDecl(pass *analysis.Pass, spans map[types.Object]span, d *ast.Ge
 			return
 		}
 		for _, ident := range valueSpec.Names {
-			checkShadowing(pass, spans, ident)
+			sa.checkShadowing(ident)
 		}
 	}
 }
 
 // checkShadowing checks whether the identifier shadows an identifier in an outer scope.
-func checkShadowing(pass *analysis.Pass, spans map[types.Object]span, ident *ast.Ident) {
+func (sa *shadowAnalyzer) checkShadowing(ident *ast.Ident) {
 	if ident.Name == "_" {
 		// Can't shadow the blank identifier.
 		return
 	}
-	obj := pass.TypesInfo.Defs[ident]
+	obj := sa.pass.TypesInfo.Defs[ident]
 	if obj == nil {
 		return
 	}
@@ -243,26 +242,77 @@ func checkShadowing(pass *analysis.Pass, spans map[types.Object]span, ident *ast
 	if shadowed.Parent() == types.Universe {
 		return
 	}
-	if strict {
-		// The shadowed identifier must appear before this one to be an instance of shadowing.
-		if shadowed.Pos() > ident.Pos() {
-			return
-		}
-	} else {
-		// Don't complain if the span of validity of the shadowed identifier doesn't include
-		// the shadowing identifier.
-		span, ok := spans[shadowed]
-		if !ok {
-			pass.ReportRangef(ident, "internal error: no range for %q", ident.Name)
-			return
-		}
-		if !span.contains(ident.Pos()) {
-			return
-		}
-	}
 	// Don't complain if the types differ: that implies the programmer really wants two different things.
-	if types.Identical(obj.Type(), shadowed.Type()) {
-		line := pass.Fset.Position(shadowed.Pos()).Line
-		pass.ReportRangef(ident, "declaration of %q shadows declaration at line %d", obj.Name(), line)
+	if !types.Identical(obj.Type(), shadowed.Type()) {
+		return
 	}
+	if sa.allInnerAssignmentsUsed(obj, ident.Pos(), sa.usagesByObject[obj]) {
+		return
+	}
+	if !sa.outerUsedAfterInner(shadowed, ident.Pos()) {
+		return
+	}
+	shadowedPos := sa.pass.Fset.Position(shadowed.Pos())
+	message := fmt.Sprintf("declaration of %q shadows declaration at line %d", obj.Name(), shadowedPos.Line)
+	currentFile := sa.pass.Fset.Position(ident.Pos()).Filename
+	if shadowedPos.Filename != currentFile {
+		message += fmt.Sprintf(" in %s", filepath.Base(shadowedPos.Filename))
+	}
+	sa.pass.Report(analysis.Diagnostic{
+		Pos:     ident.Pos(),
+		End:     ident.End(),
+		Message: message,
+		Related: []analysis.RelatedInformation{{
+			Pos:     shadowed.Pos(),
+			End:     shadowed.Pos() + token.Pos(len(shadowed.Name())),
+			Message: fmt.Sprintf("shadowed symbol %q declared here", obj.Name()),
+		}},
+	})
+}
+
+func (sa *shadowAnalyzer) allInnerAssignmentsUsed(obj types.Object, declPos token.Pos, usages []*ast.Ident) bool {
+	for _, stmt := range sa.assignStmts {
+		for _, lhs := range stmt.Lhs {
+			if ident, ok := lhs.(*ast.Ident); ok {
+				if hasUnusedAssignment(ident, stmt, obj, declPos, sa.pass, usages) {
+					return false
+				}
+			}
+		}
+	}
+	for _, stmt := range sa.incDecStmts {
+		if ident, ok := stmt.X.(*ast.Ident); ok {
+			if hasUnusedAssignment(ident, stmt, obj, declPos, sa.pass, usages) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func hasUnusedAssignment(ident *ast.Ident, stmt ast.Node, obj types.Object, declPos token.Pos, pass *analysis.Pass, usages []*ast.Ident) bool {
+	if pass.TypesInfo.Uses[ident] != obj || ident.Pos() <= declPos {
+		return false
+	}
+	assignPos := ident.Pos()
+	for _, ident := range usages {
+		usePos := ident.Pos()
+		if usePos > assignPos && usePos > declPos {
+			if stmt != nil && usePos >= stmt.Pos() && usePos < stmt.End() {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func (sa *shadowAnalyzer) outerUsedAfterInner(outerObj types.Object, innerDeclPos token.Pos) bool {
+	declLine := sa.pass.Fset.Position(innerDeclPos).Line
+	for _, outerIdent := range sa.usagesByObject[outerObj] {
+		if outerIdent.Pos() > innerDeclPos && sa.pass.Fset.Position(outerIdent.Pos()).Line != declLine {
+			return true
+		}
+	}
+	return false
 }
